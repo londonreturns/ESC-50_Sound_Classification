@@ -1,5 +1,6 @@
+pyspark==3.5.0
 librosa==0.11.0
 pandas==2.2.3
-numpy==2.2.5
+numpy==1.24.3
 seaborn==0.13.2
-matplotlib
+matplotlib==3.7.1
