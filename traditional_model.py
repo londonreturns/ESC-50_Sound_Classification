@@ -1,17 +1,22 @@
 import os
 import time
-import pandas as pd
 import numpy as np
+import pandas as pd
 import librosa
 import warnings
-warnings.filterwarnings("ignore")
+import concurrent.futures
 
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import accuracy_score, classification_report
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.neighbors import KNeighborsClassifier
 
 from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
+
+warnings.filterwarnings("ignore")
 
 # -------------------------------
 # CONFIG & PATHS
@@ -21,9 +26,11 @@ data_path = os.path.join(base_path, "audio", "audio", "16000")
 csv_path = os.path.join(base_path, "esc50.csv")
 log_csv_path = "model_logs.csv"
 log_txt_path = "model_logs.txt"
+features_cache = "features.npy"
+labels_cache = "labels.npy"
 
 # -------------------------------
-# LOGGING FUNCTIONS
+# LOGGING
 # -------------------------------
 def log_output(text):
     print(text)
@@ -45,15 +52,14 @@ def log_model_results(model_name, best_params, cv_acc, test_acc, report):
 
     log_output(f"\n📌 Model: {model_name}")
     log_output(f"🎯 Best Parameters: {best_params}")
-    log_output(f"📊 Cross-Validation Accuracy: {cv_acc:.4f}")
+    log_output(f"📊 CV Accuracy: {cv_acc:.4f}")
     log_output(f"✅ Test Accuracy: {test_acc:.4f}")
     log_output("📋 Classification Report:\n" + report)
 
 # -------------------------------
-# LOAD & PREPARE DATA
+# LOAD & MAP DATA
 # -------------------------------
 df = pd.read_csv(csv_path)
-
 main_category_map = {
     'dog': 'Animals', 'rooster': 'Animals', 'pig': 'Animals', 'cow': 'Animals', 'frog': 'Animals',
     'cat': 'Animals', 'hen': 'Animals', 'insects': 'Animals', 'sheep': 'Animals', 'crow': 'Animals',
@@ -77,54 +83,53 @@ main_category_map = {
     'train': 'Exterior/urban noises', 'church_bells': 'Exterior/urban noises',
     'airplane': 'Exterior/urban noises', 'fireworks': 'Exterior/urban noises', 'hand_saw': 'Exterior/urban noises'
 }
+
 df['main_category'] = df['category'].map(main_category_map)
+
 
 # -------------------------------
 # FEATURE EXTRACTION
 # -------------------------------
 def extract_features(file_path):
     y, sr = librosa.load(file_path, sr=16000, mono=True)
-
-    # MFCCs
-    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=40)
-    mfcc_mean = np.mean(mfcc.T, axis=0)
-
-    # Chroma
+    mfcc = np.mean(librosa.feature.mfcc(y=y, sr=sr, n_mfcc=40).T, axis=0)
     chroma = np.mean(librosa.feature.chroma_stft(y=y, sr=sr).T, axis=0)
-
-    # Spectral contrast
     contrast = np.mean(librosa.feature.spectral_contrast(y=y, sr=sr).T, axis=0)
-
-    # Zero Crossing Rate
     zcr = np.mean(librosa.feature.zero_crossing_rate(y).T, axis=0)
-
-    # RMS energy
     rms = np.mean(librosa.feature.rms(y=y).T, axis=0)
+    return np.hstack([mfcc, chroma, contrast, zcr, rms])
 
-    return np.hstack([mfcc_mean, chroma, contrast, zcr, rms])
+if os.path.exists(features_cache) and os.path.exists(labels_cache):
+    log_output("✅ Loading cached features...")
+    X = np.load(features_cache)
+    y = np.load(labels_cache, allow_pickle=True)
+else:
+    log_output("🔄 Extracting features in parallel...")
+    def process_row(row):
+        file_path = os.path.join(data_path, row['filename'])
+        try:
+            return extract_features(file_path), row['main_category']
+        except Exception as e:
+            print(f"❌ Error processing {row['filename']}: {e}")
+            return None
 
-features, labels = [], []
-for _, row in df.iterrows():
-    file_path = os.path.join(data_path, row['filename'])
-    try:
-        feat = extract_features(file_path)
-        features.append(feat)
-        labels.append(row['main_category'])
-    except Exception as e:
-        print(f"Error processing {row['filename']}: {e}")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(process_row, [row for _, row in df.iterrows()]))
 
-X = np.array(features)
-y = np.array(labels)
+    features, labels = zip(*[r for r in results if r is not None])
+    X = np.array(features)
+    y = np.array(labels)
+
+    np.save(features_cache, X)
+    np.save(labels_cache, y)
+    log_output("💾 Features cached.")
 
 # -------------------------------
-# ENCODE LABELS
+# ENCODE, SPLIT, SCALE
 # -------------------------------
 label_encoder = LabelEncoder()
 y_encoded = label_encoder.fit_transform(y)
 
-# -------------------------------
-# SPLIT AND SCALE
-# -------------------------------
 X_train, X_test, y_train, y_test = train_test_split(
     X, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded)
 
@@ -133,45 +138,61 @@ X_train = scaler.fit_transform(X_train)
 X_test = scaler.transform(X_test)
 
 # -------------------------------
-# XGBOOST
+# MODEL TRAINING & LOGGING
 # -------------------------------
-xgb_params = {
-    'n_estimators': [100],
-    'max_depth': [4, 6],
-    'learning_rate': [0.1, 0.3],
-    'subsample': [0.8],
-}
-xgb_grid = GridSearchCV(
-    XGBClassifier(use_label_encoder=False, eval_metric='mlogloss', random_state=42),
-    xgb_params, cv=5, scoring='accuracy', n_jobs=-1
-)
+
+# XGBoost
+xgb_params = {'n_estimators': [100], 'max_depth': [4, 6], 'learning_rate': [0.1, 0.3], 'subsample': [0.8]}
+xgb_grid = GridSearchCV(XGBClassifier(use_label_encoder=False, eval_metric='mlogloss',
+                                      tree_method='gpu_hist', gpu_id=0, random_state=42),
+                        xgb_params, cv=5, scoring='accuracy', n_jobs=-1)
 xgb_grid.fit(X_train, y_train)
 xgb_preds = xgb_grid.best_estimator_.predict(X_test)
+xgb_report = classification_report(label_encoder.inverse_transform(y_test),
+                                   label_encoder.inverse_transform(xgb_preds))
+log_model_results("XGBoost (GPU)", xgb_grid.best_params_, xgb_grid.best_score_,
+                  accuracy_score(y_test, xgb_preds), xgb_report)
 
-xgb_report = classification_report(
-    label_encoder.inverse_transform(y_test),
-    label_encoder.inverse_transform(xgb_preds)
-)
-log_model_results("XGBoost", xgb_grid.best_params_, xgb_grid.best_score_, accuracy_score(y_test, xgb_preds), xgb_report)
-
-# -------------------------------
-# LIGHTGBM
-# -------------------------------
-lgbm_params = {
-    'n_estimators': [100],
-    'max_depth': [4, 6],
-    'learning_rate': [0.1, 0.3],
-    'num_leaves': [31, 50],
-}
-lgbm_grid = GridSearchCV(
-    LGBMClassifier(random_state=42),
-    lgbm_params, cv=5, scoring='accuracy', n_jobs=-1
-)
+# LightGBM
+lgbm_params = {'n_estimators': [100], 'max_depth': [4, 6], 'learning_rate': [0.1, 0.3], 'num_leaves': [31, 50]}
+lgbm_grid = GridSearchCV(LGBMClassifier(device='gpu', random_state=42),
+                         lgbm_params, cv=5, scoring='accuracy', n_jobs=-1)
 lgbm_grid.fit(X_train, y_train)
 lgbm_preds = lgbm_grid.best_estimator_.predict(X_test)
+lgbm_report = classification_report(label_encoder.inverse_transform(y_test),
+                                    label_encoder.inverse_transform(lgbm_preds))
+log_model_results("LightGBM (GPU)", lgbm_grid.best_params_, lgbm_grid.best_score_,
+                  accuracy_score(y_test, lgbm_preds), lgbm_report)
 
-lgbm_report = classification_report(
-    label_encoder.inverse_transform(y_test),
-    label_encoder.inverse_transform(lgbm_preds)
-)
-log_model_results("LightGBM", lgbm_grid.best_params_, lgbm_grid.best_score_, accuracy_score(y_test, lgbm_preds), lgbm_report)
+# Random Forest
+rf_params = {'n_estimators': [50, 100], 'max_depth': [10, None], 'min_samples_split': [2, 5], 'min_samples_leaf': [1, 2]}
+rf_grid = GridSearchCV(RandomForestClassifier(random_state=42),
+                       rf_params, cv=5, scoring='accuracy', n_jobs=-1)
+rf_grid.fit(X_train, y_train)
+rf_preds = rf_grid.best_estimator_.predict(X_test)
+rf_report = classification_report(label_encoder.inverse_transform(y_test),
+                                  label_encoder.inverse_transform(rf_preds))
+log_model_results("RandomForest", rf_grid.best_params_, rf_grid.best_score_,
+                  accuracy_score(y_test, rf_preds), rf_report)
+
+# SVM
+svm_params = {'kernel': ['linear', 'rbf'], 'C': [1, 10], 'gamma': ['scale', 0.1]}
+start = time.time()
+svm_grid = GridSearchCV(SVC(), svm_params, cv=5, scoring='accuracy', n_jobs=-1)
+svm_grid.fit(X_train, y_train)
+svm_preds = svm_grid.best_estimator_.predict(X_test)
+svm_report = classification_report(label_encoder.inverse_transform(y_test),
+                                   label_encoder.inverse_transform(svm_preds))
+log_output(f"\n⏱️ SVM Grid Search Time: {time.time() - start:.2f} seconds")
+log_model_results("SVM", svm_grid.best_params_, svm_grid.best_score_,
+                  accuracy_score(y_test, svm_preds), svm_report)
+
+# KNN
+knn_params = {'n_neighbors': [3, 5], 'weights': ['uniform', 'distance'], 'algorithm': ['auto', 'kd_tree']}
+knn_grid = GridSearchCV(KNeighborsClassifier(), knn_params, cv=5, scoring='accuracy', n_jobs=-1)
+knn_grid.fit(X_train, y_train)
+knn_preds = knn_grid.best_estimator_.predict(X_test)
+knn_report = classification_report(label_encoder.inverse_transform(y_test),
+                                   label_encoder.inverse_transform(knn_preds))
+log_model_results("KNN", knn_grid.best_params_, knn_grid.best_score_,
+                  accuracy_score(y_test, knn_preds), knn_report)
