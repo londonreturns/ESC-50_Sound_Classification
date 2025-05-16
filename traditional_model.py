@@ -7,7 +7,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 from sklearn.model_selection import train_test_split, GridSearchCV
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import accuracy_score, classification_report
 
 from xgboost import XGBClassifier
@@ -119,19 +119,15 @@ y = np.array(labels)
 # -------------------------------
 # ENCODE LABELS
 # -------------------------------
-encoder = OneHotEncoder(sparse_output=False)
-y_onehot = encoder.fit_transform(y.reshape(-1, 1))
-label_names = encoder.categories_[0]
-y_labels = np.array([label_names[i] for i in np.argmax(y_onehot, axis=1)])
+label_encoder = LabelEncoder()
+y_encoded = label_encoder.fit_transform(y)
 
 # -------------------------------
-# TRAIN/TEST SPLIT
+# SPLIT AND SCALE
 # -------------------------------
-X_train, X_test, y_train, y_test = train_test_split(X, y_labels, test_size=0.2, random_state=42, stratify=y_labels)
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded)
 
-# -------------------------------
-# SCALING
-# -------------------------------
 scaler = StandardScaler()
 X_train = scaler.fit_transform(X_train)
 X_test = scaler.transform(X_test)
@@ -145,11 +141,18 @@ xgb_params = {
     'learning_rate': [0.1, 0.3],
     'subsample': [0.8],
 }
-xgb_grid = GridSearchCV(XGBClassifier(use_label_encoder=False, eval_metric='mlogloss', random_state=42),
-                        xgb_params, cv=5, scoring='accuracy', n_jobs=-1)
+xgb_grid = GridSearchCV(
+    XGBClassifier(use_label_encoder=False, eval_metric='mlogloss', random_state=42),
+    xgb_params, cv=5, scoring='accuracy', n_jobs=-1
+)
 xgb_grid.fit(X_train, y_train)
 xgb_preds = xgb_grid.best_estimator_.predict(X_test)
-log_model_results("XGBoost", xgb_grid.best_params_, xgb_grid.best_score_, accuracy_score(y_test, xgb_preds), classification_report(y_test, xgb_preds))
+
+xgb_report = classification_report(
+    label_encoder.inverse_transform(y_test),
+    label_encoder.inverse_transform(xgb_preds)
+)
+log_model_results("XGBoost", xgb_grid.best_params_, xgb_grid.best_score_, accuracy_score(y_test, xgb_preds), xgb_report)
 
 # -------------------------------
 # LIGHTGBM
@@ -160,8 +163,15 @@ lgbm_params = {
     'learning_rate': [0.1, 0.3],
     'num_leaves': [31, 50],
 }
-lgbm_grid = GridSearchCV(LGBMClassifier(random_state=42),
-                         lgbm_params, cv=5, scoring='accuracy', n_jobs=-1)
+lgbm_grid = GridSearchCV(
+    LGBMClassifier(random_state=42),
+    lgbm_params, cv=5, scoring='accuracy', n_jobs=-1
+)
 lgbm_grid.fit(X_train, y_train)
 lgbm_preds = lgbm_grid.best_estimator_.predict(X_test)
-log_model_results("LightGBM", lgbm_grid.best_params_, lgbm_grid.best_score_, accuracy_score(y_test, lgbm_preds), classification_report(y_test, lgbm_preds))
+
+lgbm_report = classification_report(
+    label_encoder.inverse_transform(y_test),
+    label_encoder.inverse_transform(lgbm_preds)
+)
+log_model_results("LightGBM", lgbm_grid.best_params_, lgbm_grid.best_score_, accuracy_score(y_test, lgbm_preds), lgbm_report)
