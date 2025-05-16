@@ -3,13 +3,15 @@ import time
 import pandas as pd
 import numpy as np
 import librosa
+import warnings
+warnings.filterwarnings("ignore")
 
 from sklearn.model_selection import train_test_split, GridSearchCV
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.svm import SVC
-from sklearn.neighbors import KNeighborsClassifier
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.metrics import accuracy_score, classification_report
+
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
 
 # -------------------------------
 # CONFIG & PATHS
@@ -21,7 +23,7 @@ log_csv_path = "model_logs.csv"
 log_txt_path = "model_logs.txt"
 
 # -------------------------------
-# LOGGING FUNCTION
+# LOGGING FUNCTIONS
 # -------------------------------
 def log_output(text):
     print(text)
@@ -29,7 +31,6 @@ def log_output(text):
         f.write(text + "\n")
 
 def log_model_results(model_name, best_params, cv_acc, test_acc, report):
-    # Log to CSV
     log_df = pd.DataFrame([{
         'model': model_name,
         'best_params': str(best_params),
@@ -42,7 +43,6 @@ def log_model_results(model_name, best_params, cv_acc, test_acc, report):
     else:
         log_df.to_csv(log_csv_path, index=False)
 
-    # Log to TXT
     log_output(f"\n📌 Model: {model_name}")
     log_output(f"🎯 Best Parameters: {best_params}")
     log_output(f"📊 Cross-Validation Accuracy: {cv_acc:.4f}")
@@ -54,7 +54,6 @@ def log_model_results(model_name, best_params, cv_acc, test_acc, report):
 # -------------------------------
 df = pd.read_csv(csv_path)
 
-# Map to main categories
 main_category_map = {
     'dog': 'Animals', 'rooster': 'Animals', 'pig': 'Animals', 'cow': 'Animals', 'frog': 'Animals',
     'cat': 'Animals', 'hen': 'Animals', 'insects': 'Animals', 'sheep': 'Animals', 'crow': 'Animals',
@@ -83,14 +82,36 @@ df['main_category'] = df['category'].map(main_category_map)
 # -------------------------------
 # FEATURE EXTRACTION
 # -------------------------------
+def extract_features(file_path):
+    y, sr = librosa.load(file_path, sr=16000, mono=True)
+
+    # MFCCs
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=40)
+    mfcc_mean = np.mean(mfcc.T, axis=0)
+
+    # Chroma
+    chroma = np.mean(librosa.feature.chroma_stft(y=y, sr=sr).T, axis=0)
+
+    # Spectral contrast
+    contrast = np.mean(librosa.feature.spectral_contrast(y=y, sr=sr).T, axis=0)
+
+    # Zero Crossing Rate
+    zcr = np.mean(librosa.feature.zero_crossing_rate(y).T, axis=0)
+
+    # RMS energy
+    rms = np.mean(librosa.feature.rms(y=y).T, axis=0)
+
+    return np.hstack([mfcc_mean, chroma, contrast, zcr, rms])
+
 features, labels = [], []
 for _, row in df.iterrows():
     file_path = os.path.join(data_path, row['filename'])
-    y, sr = librosa.load(file_path, sr=16000, mono=True)
-    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=40)
-    mfcc_mean = np.mean(mfcc.T, axis=0)
-    features.append(mfcc_mean)
-    labels.append(row['main_category'])
+    try:
+        feat = extract_features(file_path)
+        features.append(feat)
+        labels.append(row['main_category'])
+    except Exception as e:
+        print(f"Error processing {row['filename']}: {e}")
 
 X = np.array(features)
 y = np.array(labels)
@@ -109,43 +130,38 @@ y_labels = np.array([label_names[i] for i in np.argmax(y_onehot, axis=1)])
 X_train, X_test, y_train, y_test = train_test_split(X, y_labels, test_size=0.2, random_state=42, stratify=y_labels)
 
 # -------------------------------
-# RANDOM FOREST
+# SCALING
 # -------------------------------
-rf_params = {
-    'n_estimators': [50, 100],
-    'max_depth': [10, None],
-    'min_samples_split': [2, 5],
-    'min_samples_leaf': [1, 2],
-}
-rf_grid = GridSearchCV(RandomForestClassifier(random_state=42), rf_params, cv=5, scoring='accuracy', n_jobs=-1)
-rf_grid.fit(X_train, y_train)
-rf_preds = rf_grid.best_estimator_.predict(X_test)
-log_model_results("RandomForest", rf_grid.best_params_, rf_grid.best_score_, accuracy_score(y_test, rf_preds), classification_report(y_test, rf_preds))
+scaler = StandardScaler()
+X_train = scaler.fit_transform(X_train)
+X_test = scaler.transform(X_test)
 
 # -------------------------------
-# SVM
+# XGBOOST
 # -------------------------------
-svm_params = {
-    'kernel': ['linear', 'rbf'],
-    'C': [1, 10],
-    'gamma': ['scale', 0.1],
+xgb_params = {
+    'n_estimators': [100],
+    'max_depth': [4, 6],
+    'learning_rate': [0.1, 0.3],
+    'subsample': [0.8],
 }
-start = time.time()
-svm_grid = GridSearchCV(SVC(), svm_params, cv=5, scoring='accuracy', n_jobs=-1)
-svm_grid.fit(X_train, y_train)
-svm_preds = svm_grid.best_estimator_.predict(X_test)
-log_output(f"\n⏱️ SVM Grid Search Time: {time.time() - start:.2f} seconds")
-log_model_results("SVM", svm_grid.best_params_, svm_grid.best_score_, accuracy_score(y_test, svm_preds), classification_report(y_test, svm_preds))
+xgb_grid = GridSearchCV(XGBClassifier(use_label_encoder=False, eval_metric='mlogloss', random_state=42),
+                        xgb_params, cv=5, scoring='accuracy', n_jobs=-1)
+xgb_grid.fit(X_train, y_train)
+xgb_preds = xgb_grid.best_estimator_.predict(X_test)
+log_model_results("XGBoost", xgb_grid.best_params_, xgb_grid.best_score_, accuracy_score(y_test, xgb_preds), classification_report(y_test, xgb_preds))
 
 # -------------------------------
-# KNN
+# LIGHTGBM
 # -------------------------------
-knn_params = {
-    'n_neighbors': [3, 5],
-    'weights': ['uniform', 'distance'],
-    'algorithm': ['auto', 'kd_tree'],
+lgbm_params = {
+    'n_estimators': [100],
+    'max_depth': [4, 6],
+    'learning_rate': [0.1, 0.3],
+    'num_leaves': [31, 50],
 }
-knn_grid = GridSearchCV(KNeighborsClassifier(), knn_params, cv=5, scoring='accuracy', n_jobs=-1)
-knn_grid.fit(X_train, y_train)
-knn_preds = knn_grid.best_estimator_.predict(X_test)
-log_model_results("KNN", knn_grid.best_params_, knn_grid.best_score_, accuracy_score(y_test, knn_preds), classification_report(y_test, knn_preds))
+lgbm_grid = GridSearchCV(LGBMClassifier(random_state=42),
+                         lgbm_params, cv=5, scoring='accuracy', n_jobs=-1)
+lgbm_grid.fit(X_train, y_train)
+lgbm_preds = lgbm_grid.best_estimator_.predict(X_test)
+log_model_results("LightGBM", lgbm_grid.best_params_, lgbm_grid.best_score_, accuracy_score(y_test, lgbm_preds), classification_report(y_test, lgbm_preds))
